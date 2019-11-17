@@ -18,6 +18,7 @@ pub struct CompUnitParser {
 
 enum Node {
     Subprogram(gimli::DebugInfoOffset),
+    InlinedSubroutine(gimli::DebugInfoOffset),
     Other,
 }
 
@@ -71,11 +72,14 @@ impl CompUnitParser {
                     get_abstract_origin()?
                         .unwrap_or_else(|| entry.offset().to_debug_info_offset(&header)),
                 ),
+                gimli::DW_TAG_inlined_subroutine => {
+                    Node::InlinedSubroutine(get_abstract_origin()?.unwrap())
+                }
                 _ => Node::Other,
             };
 
             match node {
-                Node::Subprogram(offset) => {
+                Node::Subprogram(offset) | Node::InlinedSubroutine(offset) => {
                     let subroutine = self.subroutines.entry(offset).or_default();
 
                     if let Node::Subprogram(_) = node {
@@ -89,6 +93,25 @@ impl CompUnitParser {
                         .entity_size(dwarf, &unit)?
                         .unwrap_or(0) as u32;
                     subroutine.size += size;
+
+                    if let Node::InlinedSubroutine(_) = node {
+                        // Subtract the inlined size from the innermost
+                        // sorrounding `Subprogram` or `InlinedSubroutine`.
+                        for node in stack.iter_mut().rev() {
+                            match node {
+                                Node::Subprogram(caller_offset)
+                                | Node::InlinedSubroutine(caller_offset) => {
+                                    let caller = self.subroutines.get_mut(caller_offset).unwrap();
+                                    // FIXME(eddyb) take ranges into account properly, even when they overlap.
+                                    if caller.size >= size {
+                                        caller.size -= size;
+                                    }
+                                    break;
+                                }
+                                Node::Other => {}
+                            }
+                        }
+                    }
                 }
                 Node::Other => {}
             }
