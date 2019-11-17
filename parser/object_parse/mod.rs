@@ -1,6 +1,5 @@
 use std::borrow::{Borrow, Cow};
 
-use fallible_iterator::FallibleIterator;
 use gimli;
 use object::{self, Object};
 use twiggy_ir as ir;
@@ -10,7 +9,7 @@ use typed_arena::Arena;
 mod compilation_unit_parse;
 mod die_parse;
 
-use self::compilation_unit_parse::{CompUnitEdgesExtra, CompUnitItemsExtra};
+use self::compilation_unit_parse::CompUnitParser;
 use super::Parse;
 
 // Helper function used to load a given section of the file.
@@ -71,7 +70,7 @@ pub fn parse(items: &mut ir::ItemsBuilder, data: &[u8]) -> Result<(), traits::Er
     Ok(())
 }
 
-impl<'a, R: gimli::Reader> Parse<'a> for gimli::Dwarf<R> {
+impl<'a, R: gimli::Reader<Offset = usize>> Parse<'a> for gimli::Dwarf<R> {
     type ItemsExtra = ();
 
     fn parse_items(
@@ -79,15 +78,21 @@ impl<'a, R: gimli::Reader> Parse<'a> for gimli::Dwarf<R> {
         items: &mut ir::ItemsBuilder,
         _extra: Self::ItemsExtra,
     ) -> Result<(), traits::Error> {
+        let mut parser = CompUnitParser::default();
+
         // Parse the items in each compilation unit.
-        let mut headers = self.units().enumerate();
-        while let Some((unit_id, header)) = headers.next()? {
-            let mut unit = self.unit(header)?;
-            let extra = CompUnitItemsExtra {
-                unit_id,
-                dwarf: self,
-            };
-            unit.parse_items(items, extra)?
+        let mut headers = self.units();
+        while let Some(header) = headers.next()? {
+            parser.parse(self, header)?;
+        }
+
+        for (offset, subroutine) in parser.subroutines {
+            let name = subroutine
+                .name
+                .unwrap_or_else(|| format!("Subroutine[{:#x}]", offset.0));
+            let kind: ir::ItemKind = ir::Code::new(&name).into();
+            let id = ir::Id::entry(0, offset.0);
+            items.add_item(ir::Item::new(id, name, subroutine.size, kind));
         }
 
         Ok(())
@@ -97,17 +102,9 @@ impl<'a, R: gimli::Reader> Parse<'a> for gimli::Dwarf<R> {
 
     fn parse_edges(
         &mut self,
-        items: &mut ir::ItemsBuilder,
+        _items: &mut ir::ItemsBuilder,
         _extra: Self::EdgesExtra,
     ) -> Result<(), traits::Error> {
-        // Parse the edges in each compilation unit.
-        let mut headers = self.units().enumerate();
-        while let Some((unit_id, header)) = headers.next()? {
-            let mut unit = self.unit(header)?;
-            let extra = CompUnitEdgesExtra { unit_id };
-            unit.parse_edges(items, extra)?
-        }
-
         Ok(())
     }
 }

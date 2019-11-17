@@ -1,41 +1,39 @@
 use gimli;
-use twiggy_ir as ir;
+use std::collections::BTreeMap;
 use twiggy_traits as traits;
 
-use super::die_parse::DieItemsExtra;
-use super::Parse;
+use super::die_parse::item_name::item_name;
+use super::die_parse::location_attrs::DieLocationAttributes;
 
-pub struct CompUnitItemsExtra<'input, R>
-where
-    R: 'input + gimli::Reader,
-{
-    pub unit_id: usize,
-    pub dwarf: &'input gimli::Dwarf<R>,
+#[derive(Default)]
+pub struct Subroutine {
+    pub name: Option<String>,
+    pub size: u32,
 }
 
-pub struct CompUnitEdgesExtra {
-    pub unit_id: usize,
+#[derive(Default)]
+pub struct CompUnitParser {
+    pub subroutines: BTreeMap<gimli::DebugInfoOffset, Subroutine>,
 }
 
-impl<'input, R> Parse<'input> for gimli::Unit<R>
-where
-    R: 'input + gimli::Reader,
-{
-    type ItemsExtra = CompUnitItemsExtra<'input, R>;
+enum Node {
+    Subprogram(gimli::DebugInfoOffset),
+    Other,
+}
 
-    fn parse_items(
+impl CompUnitParser {
+    pub fn parse<'input, R>(
         &mut self,
-        items: &mut ir::ItemsBuilder,
-        extra: Self::ItemsExtra,
-    ) -> Result<(), traits::Error> {
-        // Destructure the extra information needed to parse items in the unit.
-        let Self::ItemsExtra { unit_id, dwarf } = extra;
-
-        // Initialize an entry ID counter.
-        let mut entry_id = 0;
+        dwarf: &'input gimli::Dwarf<R>,
+        header: gimli::CompilationUnitHeader<R>,
+    ) -> Result<(), traits::Error>
+    where
+        R: 'input + gimli::Reader<Offset = usize>,
+    {
+        let unit = dwarf.unit(header.clone())?;
 
         // Create an entries cursor, and move it to the root.
-        let mut die_cursor = self.entries();
+        let mut die_cursor = unit.entries();
 
         if die_cursor.next_dfs()?.is_none() {
             let e = traits::Error::with_msg(
@@ -45,63 +43,57 @@ where
         }
 
         // Parse the contained debugging information entries in depth-first order.
-        let mut depth = 0;
-        while let Some((delta, mut entry)) = die_cursor.next_dfs()? {
-            // Update depth value, and break out of the loop when we
+        let mut stack: Vec<Node> = vec![];
+        'dfs: while let Some((delta, entry)) = die_cursor.next_dfs()? {
+            // Update the stack, and break out of the loop when we
             // return to the original starting position.
-            depth += delta;
-            if depth <= 0 {
-                break;
+            for _ in delta..=0 {
+                if stack.pop().is_none() {
+                    assert!(die_cursor.next_dfs()?.is_none());
+                    break 'dfs;
+                }
             }
 
-            let die_extra = DieItemsExtra {
-                entry_id,
-                unit_id,
-                dwarf,
-                unit: self,
+            let get_abstract_origin = || -> gimli::Result<_> {
+                Ok(entry
+                    .attr_value(gimli::DW_AT_abstract_origin)?
+                    .map(|origin| match origin {
+                        gimli::AttributeValue::UnitRef(offset) => {
+                            offset.to_debug_info_offset(&header)
+                        }
+                        gimli::AttributeValue::DebugInfoRef(offset) => offset,
+                        attr => panic!("unexpected `DW_AT_abstract_origin` value `{:?}`", attr),
+                    }))
             };
-            entry.parse_items(items, die_extra)?;
-            entry_id += 1;
-        }
 
-        Ok(())
-    }
+            let node = match entry.tag() {
+                gimli::DW_TAG_subprogram => Node::Subprogram(
+                    get_abstract_origin()?
+                        .unwrap_or_else(|| entry.offset().to_debug_info_offset(&header)),
+                ),
+                _ => Node::Other,
+            };
 
-    type EdgesExtra = CompUnitEdgesExtra;
+            match node {
+                Node::Subprogram(offset) => {
+                    let subroutine = self.subroutines.entry(offset).or_default();
 
-    fn parse_edges(
-        &mut self,
-        items: &mut ir::ItemsBuilder,
-        extra: Self::EdgesExtra,
-    ) -> Result<(), traits::Error> {
-        let Self::EdgesExtra { unit_id } = extra;
+                    if let Node::Subprogram(_) = node {
+                        if let Some(name) = item_name(entry, dwarf, &unit)? {
+                            assert_eq!(subroutine.name, None);
+                            subroutine.name = Some(name);
+                        }
+                    }
 
-        // Initialize an entry ID counter.
-        let mut entry_id = 0;
-
-        // Create an entries cursor, and move it to the root.
-        let mut die_cursor = self.entries();
-
-        if die_cursor.next_dfs()?.is_none() {
-            let e = traits::Error::with_msg(
-                "Unexpected error while traversing debugging information entries.",
-            );
-            return Err(e);
-        }
-
-        // Parse the contained debugging information entries in depth-first order.
-        let mut depth = 0;
-        while let Some((delta, mut entry)) = die_cursor.next_dfs()? {
-            // Update depth value, and break out of the loop when we
-            // return to the original starting position.
-            depth += delta;
-            if depth <= 0 {
-                break;
+                    let size = DieLocationAttributes::try_from(entry)?
+                        .entity_size(dwarf, &unit)?
+                        .unwrap_or(0) as u32;
+                    subroutine.size += size;
+                }
+                Node::Other => {}
             }
 
-            let _ir_id = ir::Id::entry(unit_id, entry_id);
-            entry.parse_edges(items, ())?;
-            entry_id += 1;
+            stack.push(node);
         }
 
         Ok(())
