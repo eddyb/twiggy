@@ -593,7 +593,7 @@ impl Code {
 
     fn demangle(s: &str) -> Option<String> {
         if let Ok(sym) = rustc_demangle::try_demangle(s) {
-            return Some(sym.to_string());
+            return Some(format!("{:#}", sym));
         }
 
         // If the Rust demangle failed, we'll try C or C++.  C++
